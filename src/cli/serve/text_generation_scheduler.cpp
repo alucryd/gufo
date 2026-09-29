@@ -17,6 +17,7 @@
 #include <thread>
 #include <utility>
 
+#include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 
@@ -377,6 +378,23 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  /// Keeps the process-wide deferred gauge in step. Requires queue_mutex.
+  void SetQueuedCountLocked(std::size_t count) {
+    detail::RequestsDeferred().fetch_add(
+        static_cast<std::int64_t>(count) -
+            static_cast<std::int64_t>(queued_count),
+        std::memory_order_relaxed);
+    queued_count = count;
+  }
+
+  /// Requests holding a runner: prefilling, decoding or capturing a snapshot.
+  void PublishResidentCount(std::size_t count) {
+    detail::RequestsProcessing().fetch_add(
+        static_cast<std::int64_t>(count) - published_resident_count,
+        std::memory_order_relaxed);
+    published_resident_count = static_cast<std::int64_t>(count);
+  }
+
   [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
     const std::lock_guard<std::mutex> lock(queue_mutex);
     if (queued_clients.empty()) {
@@ -386,7 +404,7 @@ struct TextGenerationScheduler::Impl {
     queued_clients.pop_front();
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
-    --queued_count;
+    SetQueuedCountLocked(queued_count - 1);
     if (!client.requests.empty()) {
       queued_clients.push_back(std::move(client));
     }
@@ -404,7 +422,7 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
       client->requests.erase(queued);
-      --queued_count;
+      SetQueuedCountLocked(queued_count - 1);
       if (client->requests.empty()) {
         queued_clients.erase(client);
       }
@@ -647,6 +665,8 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
+                                            std::memory_order_relaxed);
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
           request->result.max_prefill_chunk_tokens, step.consumed_tokens);
@@ -749,6 +769,7 @@ struct TextGenerationScheduler::Impl {
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
+    detail::TotalGenTokens().fetch_add(1, std::memory_order_relaxed);
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
@@ -1177,7 +1198,7 @@ struct TextGenerationScheduler::Impl {
                   std::back_inserter(remaining_queued));
       }
       queued_clients.clear();
-      queued_count = 0;
+      SetQueuedCountLocked(0);
     }
     for (const auto& request : remaining_queued) {
       CompleteCancelled(request);
@@ -1212,6 +1233,8 @@ struct TextGenerationScheduler::Impl {
         }
       }
       Admit(prefilling, decoding, capturing.size(), stop_token);
+      PublishResidentCount(prefilling.size() + decoding.size() +
+                           capturing.size());
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
@@ -1316,6 +1339,7 @@ struct TextGenerationScheduler::Impl {
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding);
+    PublishResidentCount(0);
   }
 
   std::shared_ptr<TextRunnerPool> runner_pool;
@@ -1332,6 +1356,7 @@ struct TextGenerationScheduler::Impl {
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
+  std::int64_t published_resident_count{0};
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
@@ -1601,7 +1626,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
         request->result.client_queue_depth_at_submit = decision_client_queued;
         admitted_prompt_tokens = request->prompt.size();
         client->requests.push_back(request);
-        ++impl_->queued_count;
+        impl_->SetQueuedCountLocked(impl_->queued_count + 1);
       }
     }
   }

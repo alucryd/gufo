@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 
@@ -1117,6 +1118,43 @@ void TestFifoReplacementAdmissionWithOneSlot() {
          "replacement admission preserves FIFO order");
 }
 
+void TestServerMetricsAreLive() {
+  namespace metrics = gufo::server::detail;
+  const auto read = [](const auto& value) {
+    return value.load(std::memory_order_relaxed);
+  };
+  const auto prompt_before = read(metrics::TotalPromptTokens());
+  const auto generated_before = read(metrics::TotalGenTokens());
+  const auto processing_before = read(metrics::RequestsProcessing());
+  const auto deferred_before = read(metrics::RequestsDeferred());
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->block_advance_label = 1;
+    auto scheduler = MakeScheduler(control, 1);
+
+    auto active = scheduler->Submit({1, 10}, 3, 0.0F);
+    control->WaitForAdvance(1);
+    Expect(read(metrics::TotalPromptTokens()) - prompt_before == 2,
+           "prompt tokens are counted when prefill executes");
+    Expect(read(metrics::TotalGenTokens()) - generated_before == 1,
+           "generated tokens are counted before the request completes");
+    Expect(read(metrics::RequestsProcessing()) - processing_before == 1,
+           "the running request is reported");
+
+    auto queued = scheduler->Submit({2, 20}, 1, 0.0F);
+    Expect(read(metrics::RequestsDeferred()) - deferred_before == 1,
+           "the waiting request is reported");
+    control->ReleaseAdvance();
+    Expect(active.Wait().tokens.size() == 3, "active request completes");
+    Expect(queued.Wait().tokens.size() == 1, "queued request completes");
+    Expect(read(metrics::TotalGenTokens()) - generated_before == 4,
+           "every generated token is counted once");
+  }
+  Expect(read(metrics::RequestsProcessing()) == processing_before &&
+             read(metrics::RequestsDeferred()) == deferred_before,
+         "a stopped scheduler withdraws its load");
+}
+
 void TestQueuedAndPrefillCancellation() {
   {
     auto control = std::make_shared<FakeControl>();
@@ -1739,6 +1777,7 @@ int main() {
   TestMidGenerationRequestJoinsNextDecodeBatch();
   TestFifoReplacementAdmissionWithOneSlot();
   TestQueuedAndPrefillCancellation();
+  TestServerMetricsAreLive();
   TestDecodeCancellationAndStateReclamation();
   TestFourResidentRequestsMakeProgress();
   TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement();

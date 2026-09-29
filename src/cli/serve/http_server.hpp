@@ -144,31 +144,9 @@ private:
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
 };
 
-namespace detail {
-inline std::atomic<std::uint64_t>& TotalPromptTokens() {
-  static std::atomic<std::uint64_t> count{0};
-  return count;
-}
-inline std::atomic<std::uint64_t>& TotalGenTokens() {
-  static std::atomic<std::uint64_t> count{0};
-  return count;
-}
-inline std::atomic<double>& LastPromptSpeed() {
-  static std::atomic<double> val{0.0};
-  return val;
-}
-inline std::atomic<double>& LastGenSpeed() {
-  static std::atomic<double> val{0.0};
-  return val;
-}
-}  // namespace detail
-
+/// The scheduler records token counters live; this keeps the last-request
+/// speed gauges.
 inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
-  detail::TotalPromptTokens().fetch_add(result.prompt_tokens,
-                                        std::memory_order_relaxed);
-  detail::TotalGenTokens().fetch_add(result.completion_tokens,
-                                     std::memory_order_relaxed);
-
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
