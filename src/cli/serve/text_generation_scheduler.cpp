@@ -102,6 +102,8 @@ struct ScheduledRequest {
   // A stalled consumer trips backpressure on every token, so the debug line is
   // written once per request. Only the scheduler thread touches this.
   bool backpressure_logged{false};
+  // Only the scheduler worker changes this, from admission through cleanup.
+  bool counted_processing{false};
   std::exception_ptr failure;
   bool terminal{false};
 };
@@ -133,6 +135,9 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
     }
     request->failure = std::move(failure);
     request->terminal = true;
+    if (std::exchange(request->counted_processing, false)) {
+      detail::RequestsProcessing().fetch_sub(1, std::memory_order_relaxed);
+    }
     request->phase.store(TextRequestPhase::kTerminal,
                          std::memory_order_release);
   }
@@ -387,14 +392,6 @@ struct TextGenerationScheduler::Impl {
     queued_count = count;
   }
 
-  /// Requests holding a runner: prefilling, decoding or capturing a snapshot.
-  void PublishResidentCount(std::size_t count) {
-    detail::RequestsProcessing().fetch_add(
-        static_cast<std::int64_t>(count) - published_resident_count,
-        std::memory_order_relaxed);
-    published_resident_count = static_cast<std::int64_t>(count);
-  }
-
   [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
     const std::lock_guard<std::mutex> lock(queue_mutex);
     if (queued_clients.empty()) {
@@ -404,6 +401,10 @@ struct TextGenerationScheduler::Impl {
     queued_clients.pop_front();
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
+    // Admission reserves a session before potentially slow cache preparation.
+    // Publish the transfer before removing it from the deferred count.
+    request->counted_processing = true;
+    detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
     SetQueuedCountLocked(queued_count - 1);
     if (!client.requests.empty()) {
       queued_clients.push_back(std::move(client));
@@ -1233,8 +1234,6 @@ struct TextGenerationScheduler::Impl {
         }
       }
       Admit(prefilling, decoding, capturing.size(), stop_token);
-      PublishResidentCount(prefilling.size() + decoding.size() +
-                           capturing.size());
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
@@ -1339,7 +1338,6 @@ struct TextGenerationScheduler::Impl {
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding);
-    PublishResidentCount(0);
   }
 
   std::shared_ptr<TextRunnerPool> runner_pool;
@@ -1356,7 +1354,6 @@ struct TextGenerationScheduler::Impl {
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
-  std::int64_t published_resident_count{0};
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
@@ -1537,6 +1534,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
   request->result.prompt_tokens = prompt.size();
+  request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;
   request->result.configured_active_prefill_tokens =
       impl_->prefill_policy.decode_active_tokens;
